@@ -1,88 +1,125 @@
 #!/bin/sh
-set -e
+set -eu
 
 WG_CONF="/etc/wireguard/wg0.conf"
-mkdir -p /etc/wireguard
+WG_DIR="/etc/wireguard"
+WGCF_VERSION="2.2.22"
+HEALTHCHECK_URL="${HEALTHCHECK_URL:-https://1.1.1.1/cdn-cgi/trace}"
+HEALTHCHECK_TIMEOUT="${HEALTHCHECK_TIMEOUT:-10}"
+mkdir -p "$WG_DIR"
 
-# ==========================================
-# 1. 账号全自动申请与配置生成 (阅后即焚)
-# ==========================================
-if [ ! -f "$WG_CONF" ]; then
-    echo "==> [MicroWARP] 未检测到配置，正在全自动初始化 Cloudflare WARP..."
-    
-    ARCH=$(uname -m)
-    case "$ARCH" in
-        x86_64) WGCF_ARCH="amd64" ;;
-        aarch64) WGCF_ARCH="arm64" ;;
-        *) echo "==> [ERROR] 不支持的架构: $ARCH"; exit 1 ;;
+log() {
+    echo "==> [MicroWARP] $*"
+}
+
+fail() {
+    echo "==> [ERROR] $*" >&2
+    exit 1
+}
+
+get_wgcf_arch() {
+    case "$(uname -m)" in
+        x86_64) echo "amd64" ;;
+        aarch64|arm64) echo "arm64" ;;
+        *) fail "Unsupported architecture: $(uname -m)" ;;
     esac
-    
-    wget -qO wgcf "https://github.com/ViRb3/wgcf/releases/download/v2.2.22/wgcf_2.2.22_linux_${WGCF_ARCH}"
-    chmod +x wgcf
-    
-    echo "==> [MicroWARP] 正在向 CF 注册设备..."
-    ./wgcf register --accept-tos > /dev/null
-    
-    echo "==> [MicroWARP] 正在生成 WireGuard 配置文件..."
-    ./wgcf generate > /dev/null
-    
+}
+
+install_wgcf() {
+    arch="$(get_wgcf_arch)"
+    binary="wgcf_${WGCF_VERSION}_linux_${arch}"
+    url="https://github.com/ViRb3/wgcf/releases/download/v${WGCF_VERSION}/${binary}"
+    checksum_url="https://github.com/ViRb3/wgcf/releases/download/v${WGCF_VERSION}/wgcf_${WGCF_VERSION}_checksums.txt"
+
+    log "Downloading wgcf ${WGCF_VERSION} for ${arch}..."
+    wget -qO /tmp/wgcf "$url"
+    wget -qO /tmp/wgcf_checksums.txt "$checksum_url"
+
+    expected_sha256="$(awk -v file="$binary" '$2 == file {print $1}' /tmp/wgcf_checksums.txt)"
+    [ -n "$expected_sha256" ] || fail "Unable to find checksum for ${binary}"
+
+    actual_sha256="$(sha256sum /tmp/wgcf | awk '{print $1}')"
+    [ "$actual_sha256" = "$expected_sha256" ] || fail "wgcf checksum verification failed"
+
+    chmod +x /tmp/wgcf
+}
+
+initialize_warp() {
+    if [ -f "$WG_CONF" ]; then
+        log "Found persisted WireGuard config, skipping registration."
+        return
+    fi
+
+    log "No WireGuard config found, initializing Cloudflare WARP account..."
+    install_wgcf
+
+    log "Registering device with Cloudflare WARP..."
+    /tmp/wgcf register --accept-tos >/dev/null
+
+    log "Generating WireGuard profile..."
+    /tmp/wgcf generate >/dev/null
+
     mv wgcf-profile.conf "$WG_CONF"
-    
-    # 【核心安全】阅后即焚：删除注册工具和生成的账号明文文件
-    rm -f wgcf wgcf-account.toml
-    echo "==> [MicroWARP] 节点配置生成成功！"
-else
-    echo "==> [MicroWARP] 检测到已有持久化配置，跳过注册。"
-fi
+    rm -f /tmp/wgcf /tmp/wgcf_checksums.txt wgcf-account.toml
+    log "WireGuard profile created successfully."
+}
 
-# ==========================================
-# 2. 强力洗白与内核兼容性处理 (魔改 wg0.conf)
-# ==========================================
-# 删除多余的内网 IP 路由和 DNS，让全局流量通过 wg0
-sed -i 's/^AllowedIPs.*/AllowedIPs = 0.0.0.0\/0/g' "$WG_CONF"
-sed -i '/Address.*:/d' "$WG_CONF" 
-sed -i '/^DNS.*/d' "$WG_CONF"
+prepare_wg_config() {
+    [ -f "$WG_CONF" ] || fail "WireGuard config not found at ${WG_CONF}"
 
-# 删除 Alpine 系统自带 wg-quick 中不兼容的路由标记
-sed -i '/src_valid_mark/d' /usr/bin/wg-quick
+    sed -i 's#^AllowedIPs.*#AllowedIPs = 0.0.0.0/0#g' "$WG_CONF"
+    sed -i '/^Address = .*:.*$/d' "$WG_CONF"
+    sed -i '/^DNS *=/d' "$WG_CONF"
 
-# 【新增：抗断流绝杀】强制注入 15 秒 UDP 心跳保活，对抗运营商 QoS 丢包
-if ! grep -q "PersistentKeepalive" "$WG_CONF"; then
-    sed -i '/\[Peer\]/a PersistentKeepalive = 15' "$WG_CONF"
-else
-    sed -i 's/PersistentKeepalive.*/PersistentKeepalive = 15/g' "$WG_CONF"
-fi
+    if grep -q '^PersistentKeepalive' "$WG_CONF"; then
+        sed -i 's/^PersistentKeepalive.*/PersistentKeepalive = 15/' "$WG_CONF"
+    else
+        sed -i '/\[Peer\]/a PersistentKeepalive = 15' "$WG_CONF"
+    fi
 
-# 【新增：防阻断绝杀】针对 HK/US 强校验机房，注入自定义优选 Endpoint IP
-if [ -n "$ENDPOINT_IP" ]; then
-    echo "==> [MicroWARP] 🔀 检测到自定义 Endpoint IP，正在覆盖默认节点: $ENDPOINT_IP"
-    sed -i "s/^Endpoint.*/Endpoint = $ENDPOINT_IP/g" "$WG_CONF"
-fi
+    if [ -n "${ENDPOINT_IP:-}" ]; then
+        log "Overriding endpoint with ENDPOINT_IP=${ENDPOINT_IP}"
+        sed -i "s#^Endpoint *=.*#Endpoint = ${ENDPOINT_IP}#" "$WG_CONF"
+    fi
+}
 
-# ==========================================
-# 3. 拉起内核网卡
-# ==========================================
-echo "==> [MicroWARP] 正在启动 Linux 内核级 wg0 网卡..."
-wg-quick up wg0 > /dev/null 2>&1
+start_wireguard() {
+    log "Starting wg0 interface..."
+    wg-quick up wg0
+    log "Current egress IP trace:"
+    curl -fsS --max-time "$HEALTHCHECK_TIMEOUT" "$HEALTHCHECK_URL" | grep '^ip=' || true
+}
 
-echo "==> [MicroWARP] 当前出口 IP 已成功变更为："
-# 获取最新的 CF 溯源 IP (加入 || true 防止网络波动导致脚本退出)
-curl -s https://1.1.1.1/cdn-cgi/trace | grep ip= || true
+validate_socks_config() {
+    LISTEN_ADDR="${BIND_ADDR:-127.0.0.1}"
+    LISTEN_PORT="${BIND_PORT:-1080}"
 
-# ==========================================
-# 4. 启动 C 语言 SOCKS5 代理服务 (带高级参数绑定)
-# ==========================================
-# 读取环境变量，如果未设置则使用默认值 0.0.0.0 和 1080
-LISTEN_ADDR=${BIND_ADDR:-"0.0.0.0"}
-LISTEN_PORT=${BIND_PORT:-"1080"}
+    case "$LISTEN_PORT" in
+        ''|*[!0-9]*) fail "BIND_PORT must be numeric" ;;
+    esac
 
-if [ -n "$SOCKS_USER" ] && [ -n "$SOCKS_PASS" ]; then
-    echo "==> [MicroWARP] 🔒 身份认证已开启 (User: $SOCKS_USER)"
-    echo "==> [MicroWARP] 🚀 MicroSOCKS 引擎已启动，正在监听 ${LISTEN_ADDR}:${LISTEN_PORT}"
-    # 使用 exec 接管进程，实现 Zero-Overhead 的底层进程控制
-    exec microsocks -i "$LISTEN_ADDR" -p "$LISTEN_PORT" -u "$SOCKS_USER" -P "$SOCKS_PASS"
-else
-    echo "==>[MicroWARP] ⚠️ 未设置密码，当前为公开访问模式"
-    echo "==>[MicroWARP] 🚀 MicroSOCKS 引擎已启动，正在监听 ${LISTEN_ADDR}:${LISTEN_PORT}"
+    if [ "$LISTEN_ADDR" = "0.0.0.0" ] || [ "$LISTEN_ADDR" = "::" ]; then
+        if [ -z "${SOCKS_USER:-}" ] || [ -z "${SOCKS_PASS:-}" ]; then
+            fail "Refusing to bind ${LISTEN_ADDR}:${LISTEN_PORT} without SOCKS_USER and SOCKS_PASS"
+        fi
+    fi
+
+    export LISTEN_ADDR LISTEN_PORT
+}
+
+start_microsocks() {
+    validate_socks_config
+
+    if [ -n "${SOCKS_USER:-}" ] && [ -n "${SOCKS_PASS:-}" ]; then
+        log "Authentication enabled. Listening on ${LISTEN_ADDR}:${LISTEN_PORT}"
+        exec microsocks -i "$LISTEN_ADDR" -p "$LISTEN_PORT" -u "$SOCKS_USER" -P "$SOCKS_PASS"
+    fi
+
+    log "Authentication disabled. Listening on ${LISTEN_ADDR}:${LISTEN_PORT}"
     exec microsocks -i "$LISTEN_ADDR" -p "$LISTEN_PORT"
-fi
+}
+
+initialize_warp
+prepare_wg_config
+start_wireguard
+start_microsocks

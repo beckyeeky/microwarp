@@ -1,30 +1,21 @@
-# ==========================================
-# 阶段 1：极速编译 MicroSOCKS 引擎
-# ==========================================
-FROM alpine:latest AS builder
-# 安装 C 语言编译环境
-RUN apk add --no-cache build-base git
-# 从官方仓库拉取源码并编译 (只需 2 秒)
-RUN git clone https://github.com/rofl0r/microsocks.git /src && \
-    cd /src && make
+FROM alpine:3.20 AS builder
 
-# ==========================================
-# 阶段 2：极净运行环境
-# ==========================================
-FROM alpine:latest
+ARG MICROSOCKS_REF=v1.0.5
+RUN apk add --no-cache build-base curl tar
+RUN curl -fsSL "https://github.com/rofl0r/microsocks/archive/refs/tags/${MICROSOCKS_REF}.tar.gz" -o /tmp/microsocks.tar.gz \
+    && mkdir -p /src \
+    && tar -xzf /tmp/microsocks.tar.gz -C /src --strip-components=1 \
+    && make -C /src
 
-# 仅安装必要的内核级 WireGuard 和网络控制工具
-RUN apk add --no-cache wireguard-tools iptables iproute2 wget curl
+FROM alpine:3.20
 
-# 把刚才编译好的二进制可执行文件“偷”过来
+RUN apk add --no-cache wireguard-tools iptables iproute2 wget curl netcat-openbsd
+
 COPY --from=builder /src/microsocks /usr/local/bin/microsocks
-
 WORKDIR /app
-COPY entrypoint.sh .
-RUN chmod +x entrypoint.sh
+COPY entrypoint.sh healthcheck.sh ./
+RUN chmod +x /app/entrypoint.sh /app/healthcheck.sh
 
-# 暴露标准 SOCKS5 端口
 EXPOSE 1080
-
-# 启动引擎
-CMD ["./entrypoint.sh"]
+HEALTHCHECK --interval=30s --timeout=15s --start-period=20s --retries=3 CMD ["/app/healthcheck.sh"]
+CMD ["/app/entrypoint.sh"]
