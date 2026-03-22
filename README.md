@@ -3,7 +3,7 @@
 [![Docker Pulls](https://img.shields.io/badge/docker-ready-blue.svg)](https://github.com/ccbkkb/MicroWARP/packages)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-[English](#english) | [中文说明](#chinese)
+[English](#english) |[中文说明](#chinese)
 
 ### 📊 Performance Comparison (性能碾压对比)
 
@@ -57,7 +57,7 @@ services:
     container_name: microwarp
     restart: always
     ports:
-      - "1080:1080" # Standard SOCKS5 port (No Auth)
+      - "1080:1080"
     cap_add:
       - NET_ADMIN
       - SYS_MODULE
@@ -75,7 +75,30 @@ Run the container:
 docker compose up -d
 ```
 
-Once running, configure your apps (Telegram, v2ray, Xray, AIzaSy) to use `socks5://127.0.0.1:1080`. Your traffic is now securely routed through Cloudflare's backbone!
+### 🔥 Advanced Features (Auth, Port, Bypass DPI)
+
+MicroWARP supports powerful environment variables to customize your setup while keeping the RAM at 800KB:
+
+```yaml
+    environment:
+      - BIND_ADDR=0.0.0.0     # Bind address (default: 0.0.0.0)
+      - BIND_PORT=1080        # Custom SOCKS5 port (default: 1080)
+      - SOCKS_USER=admin      # Enable authentication (leave empty for no auth)
+      - SOCKS_PASS=123456     # Auth password
+      - ENDPOINT_IP=162.159.193.10:2408 # Custom WARP Endpoint IP (Bypass regional blocks)
+```
+
+*(Note: If your VPS is in HK or US and cannot connect to WARP due to Cloudflare's `reserved` bytes verification, simply scan a clean CF endpoint IP and inject it via `ENDPOINT_IP`. MicroWARP will seamlessly route traffic through it!)*
+
+### 🚀 Need an HTTP Proxy?
+
+MicroWARP strictly adheres to the Unix philosophy. We keep the memory usage at **800KB** by providing a pure L4 SOCKS5 engine. We will never bloat the image with heavy L7 HTTP parsers. 
+
+If your app only supports HTTP proxies, you can elegantly chain it with tools like `gost`:
+```bash
+nohup gost -F=socks5://admin:123456@127.0.0.1:1080 -L=http://:8081 > /dev/null 2>&1 &
+```
+*⚠️ **Pro Tip**: Use `socks5://` instead of `socks5h://`. This forces the host to resolve DNS locally, completely avoiding `503 Service Unavailable` errors caused by WireGuard's UDP handshake delay!*
 
 ### 📝 Auto-Registration
 Zero configuration required. On the first run, MicroWARP will automatically register a free WARP account and persist the configuration in the Docker volume.
@@ -130,6 +153,31 @@ docker compose up -d
 ```
 
 启动后，将你的应用（Telegram、v2ray、Xray、AIzaSy、Grok2API 等）的 SOCKS5 代理指向 `127.0.0.1:1080`，你的出站流量就已经被 Cloudflare 骨干网完美接管并洗白了！
+
+### 🔥 进阶配置：自定义端口、密码认证与抗阻断
+
+MicroWARP 支持极其强大的环境变量注入配置，并且开启这些功能后，内存依旧保持 **800KB** 的神话：
+
+```yaml
+    environment:
+      - BIND_ADDR=0.0.0.0     # 监听地址 (默认 0.0.0.0，可改为 127.0.0.1 仅限本机)
+      - BIND_PORT=1080        # 监听端口 (默认 1080)
+      - SOCKS_USER=admin      # SOCKS5 认证用户名 (留空则为无密码模式)
+      - SOCKS_PASS=123456     # SOCKS5 认证密码
+      
+      # ⚠️ 针对香港/美西机房的防阻断绝杀：
+      - ENDPOINT_IP=162.159.193.10:2408 # 注入你扫出的优选 IP，完美绕过 CF 的 reserved 字节阻断！
+```
+
+### 🚀 高级玩法：如何将其转换为 HTTP 代理？
+
+MicroWARP 坚守 Unix 哲学（Do one thing and do it well）。为了保持 800KB 的极限内存，我们绝不会在底层内置臃肿的七层 HTTP 解析引擎。
+
+如果你需要 HTTP 代理，可以使用 `gost` 极其优雅地串联转换（L4 转 L7）：
+```bash
+nohup gost -F=socks5://admin:123456@127.0.0.1:1080 -L=http://:8081 > /dev/null 2>&1 &
+```
+*⚠️ **避坑诊断指南**：请务必使用 `socks5://` 而不是 `socks5h://`。去掉 `h` 可以让 gost 在宿主机本地网络解析 DNS，完美避开 WARP UDP 隧道冷启动握手时容易触发的 DNS 解析死锁，彻底告别偶尔出现的 `503 Service Unavailable` 报错！稳如老狗！*
 
 ### 📝 全自动免配置
 你不需要手动提取任何密钥。首次启动时，MicroWARP 会在后台全自动向 Cloudflare 申请注册免费 WARP 账户，提取节点信息，并永久保存在本地的数据卷中。
